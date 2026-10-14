@@ -1,0 +1,104 @@
+# Copyright (c) Files Community
+# Licensed under the MIT License.
+
+# Builds the x64 MSIX bundle and publishes it as a GitHub Release asset.
+
+name: Files CD (GitHub Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Git tag and release name (for example, v4.3.0)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-2025-vs2026
+
+    env:
+      CONFIGURATION: Release
+      PLATFORM: x64
+      ARTIFACTS_STAGING_DIR: '${{ github.workspace }}\artifacts'
+      APPX_PACKAGE_DIR: '${{ github.workspace }}\artifacts\AppxPackages\'
+      APPX_SELFSIGNED_CERT_PATH: '${{ github.workspace }}\artifacts\FilesApp_SelfSigned.pfx'
+
+    steps:
+    - name: Checkout the repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        global-json-file: global.json
+
+    - name: Create a temporary signing certificate
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path $env:ARTIFACTS_STAGING_DIR | Out-Null
+        ./.github/scripts/Generate-SelfCertPfx.ps1 -Destination "$env:APPX_SELFSIGNED_CERT_PATH"
+        $certificate = Get-ChildItem Cert:\CurrentUser\My |
+          Where-Object { $_.FriendlyName -eq 'FilesApp_SelfSigned' } |
+          Sort-Object NotAfter -Descending |
+          Select-Object -First 1
+        if (-not $certificate) { throw 'The temporary signing certificate was not created.' }
+        Export-Certificate -Cert $certificate -FilePath "$env:ARTIFACTS_STAGING_DIR\FilesApp_SelfSigned.cer" | Out-Null
+
+    - name: Restore Files
+      shell: pwsh
+      run: |
+        msbuild Files.slnx `
+          -t:Restore `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:PublishReadyToRun=true `
+          -v:quiet
+
+    - name: Build and package Files
+      shell: pwsh
+      run: |
+        msbuild src\Files.App\Files.App.csproj `
+          -t:Build `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:Platform=$env:PLATFORM `
+          -p:AppxBundlePlatforms=$env:PLATFORM `
+          -p:AppxBundle=Always `
+          -p:GenerateAppxPackageOnBuild=true `
+          -p:UapAppxPackageBuildMode=SideloadOnly `
+          -p:AppxPackageDir="$env:APPX_PACKAGE_DIR" `
+          -p:AppxPackageSigningEnabled=true `
+          -p:PackageCertificateKeyFile="$env:APPX_SELFSIGNED_CERT_PATH" `
+          -p:PackageCertificatePassword="" `
+          -p:PackageCertificateThumbprint="" `
+          -v:quiet
+
+        $bundle = Get-ChildItem $env:APPX_PACKAGE_DIR -Recurse -Filter '*.msixbundle' |
+          Select-Object -First 1
+        if (-not $bundle) { throw 'The build did not produce an MSIX bundle.' }
+        Copy-Item $bundle.FullName "$env:ARTIFACTS_STAGING_DIR\Files-x64.msixbundle" -Force
+        Remove-Item $env:APPX_SELFSIGNED_CERT_PATH -Force
+
+    - name: Publish GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        target_commitish: ${{ github.sha }}
+        generate_release_notes: true
+        files: |
+          artifacts/Files-x64.msixbundle
+          artifacts/FilesApp_SelfSigned.cer
